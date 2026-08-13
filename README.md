@@ -56,7 +56,7 @@ pip install fastapi uvicorn pandas openpyxl python-multipart
 ### 2. Frontend setup
 
 ```bash
-cd frontend
+cd frontend/my-app
 npm install
 ```
 
