@@ -7,6 +7,7 @@ backend/**/__pycache__/
 backend/*.pyc
 backend/.pytest_cache/
 *.egg-info/
+pyvenv.cfg
 
 # Environment variables
 .env
