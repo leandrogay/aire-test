@@ -1,5 +1,7 @@
 # Python / FastAPI
-backend/venv/
+backend/venv/scripts
+backend/venv/Lib
+backend/venv/app/data
 backend/__pycache__/
 backend/**/__pycache__/
 backend/*.pyc
