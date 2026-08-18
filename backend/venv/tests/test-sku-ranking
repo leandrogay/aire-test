@@ -6,15 +6,14 @@ from app.services import storage
 
 client = TestClient(app)
 
-
 @pytest.fixture(autouse=True)
-def isolatedDb(tmp_path, monkeypatch):
+def isolated_db(tmp_path, monkeypatch):
     """Point storage at a throwaway sqlite file so tests never touch real data."""
     monkeypatch.setattr(storage, "DB_PATH", tmp_path / "sales.db")
     yield
 
 
-def makeRecord(sku, product_name, quantity, total_amount, order_id="O1"):
+def make_record(sku, product_name, quantity, total_amount, order_id="O1"):
     return {
         "order_id": order_id,
         "order_date": "2026-01-01",
@@ -33,7 +32,7 @@ def makeRecord(sku, product_name, quantity, total_amount, order_id="O1"):
     }
 
 
-def seedMockSkus():
+def seed_mock_skus():
     storage.save_records(
         [
             make_record("SKU-A", "Widget A", quantity=10, total_amount=100.0),
@@ -42,7 +41,11 @@ def seedMockSkus():
         source_filename="mock.xlsx",
     )
 
-def testRanksByValueDescendingByDefault():
+
+# --- storage.get_sku_ranking ---
+
+
+def test_ranks_by_value_descending_by_default():
     storage.save_records(
         [
             make_record("SKU-A", "Widget A", quantity=10, total_amount=100.0),
@@ -57,7 +60,7 @@ def testRanksByValueDescendingByDefault():
     assert result["rank"].tolist() == [1, 2]
 
 
-def testRanksByVolumeAscending():
+def test_ranks_by_volume_ascending():
     storage.save_records(
         [
             make_record("SKU-A", "Widget A", quantity=10, total_amount=100.0),
@@ -71,7 +74,7 @@ def testRanksByVolumeAscending():
     assert result["sku"].tolist() == ["SKU-B", "SKU-A"]
 
 
-def testAggregatesMultipleOrdersForTheSameSku():
+def test_aggregates_multiple_orders_for_the_same_sku():
     storage.save_records(
         [
             make_record("SKU-A", "Widget A", quantity=10, total_amount=100.0, order_id="O1"),
@@ -88,7 +91,7 @@ def testAggregatesMultipleOrdersForTheSameSku():
     assert row["value"] == 130.0
 
 
-def testExcludesRecordsWithoutSku():
+def test_excludes_records_without_a_sku():
     storage.save_records(
         [
             make_record(None, "No SKU Item", quantity=1, total_amount=10.0),
@@ -102,23 +105,27 @@ def testExcludesRecordsWithoutSku():
     assert result["sku"].tolist() == ["SKU-A"]
 
 
-def testReturnsEmptyDataframeWhenNoRecordsIngested():
+def test_returns_empty_dataframe_when_no_records_ingested():
     result = storage.get_sku_ranking()
 
     assert result.empty
     assert list(result.columns) == ["sku", "product_name", "volume", "value", "rank"]
 
 
-def testInvalidMetricRaisesValueError():
+def test_invalid_metric_raises_value_error():
     with pytest.raises(ValueError):
         storage.get_sku_ranking(metric="invalid")
 
 
-def testInvalidOrderRaisesValueError():
+def test_invalid_order_raises_value_error():
     with pytest.raises(ValueError):
         storage.get_sku_ranking(order="invalid")
 
-def testDefaultsToRankingByValueDescending():
+
+# --- GET /api/sales/skus ---
+
+
+def test_defaults_to_ranking_by_value_descending():
     seed_mock_skus()
 
     res = client.get("/api/sales/skus")
@@ -130,7 +137,8 @@ def testDefaultsToRankingByValueDescending():
     assert [row["sku"] for row in body["skus"]] == ["SKU-B", "SKU-A"]
     assert body["skus"][0]["rank"] == 1
 
-def testRanksByVolumeWhenRequested():
+
+def test_ranks_by_volume_when_requested():
     seed_mock_skus()
 
     res = client.get("/api/sales/skus", params={"metric": "volume", "order": "asc"})
@@ -140,19 +148,19 @@ def testRanksByVolumeWhenRequested():
     assert [row["sku"] for row in body["skus"]] == ["SKU-B", "SKU-A"]
 
 
-def testRejectsInvalidMetric():
+def test_rejects_invalid_metric():
     res = client.get("/api/sales/skus", params={"metric": "bogus"})
 
     assert res.status_code == 400
 
 
-def testRejectsInvalidOrder():
+def test_rejects_invalid_order():
     res = client.get("/api/sales/skus", params={"order": "sideways"})
 
     assert res.status_code == 400
 
 
-def testReturnsEmptyListWhenNoDataIngested():
+def test_returns_empty_list_when_no_data_ingested():
     res = client.get("/api/sales/skus")
 
     assert res.status_code == 200

@@ -64,7 +64,7 @@ def get_summary_stats():
         "by_platform": by_platform,
     }
 
-def getSkuRanking(metric: str = "value", order: str = "desc") -> pd.DataFrame:
+def get_sku_ranking(metric: str = "value", order: str = "desc") -> pd.DataFrame:
     SKU_RANKING_METRICS = ("volume", "value")
     SKU_RANKING_COLUMNS = ["sku", "product_name", "volume", "value", "rank"]
     #Aggregate ingested sales records by SKU, ranked by total units sold (volume) or total revenue (value).
