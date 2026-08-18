@@ -1,0 +1,159 @@
+import pytest
+from fastapi.testclient import TestClient
+
+from app.main import app
+from app.services import storage
+
+client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def isolatedDb(tmp_path, monkeypatch):
+    """Point storage at a throwaway sqlite file so tests never touch real data."""
+    monkeypatch.setattr(storage, "DB_PATH", tmp_path / "sales.db")
+    yield
+
+
+def makeRecord(sku, product_name, quantity, total_amount, order_id="O1"):
+    return {
+        "order_id": order_id,
+        "order_date": "2026-01-01",
+        "platform": "Shopee",
+        "sku": sku,
+        "product_name": product_name,
+        "category": "General",
+        "quantity": quantity,
+        "unit_price": (total_amount / quantity) if quantity else 0,
+        "total_amount": total_amount,
+        "currency": "SGD",
+        "customer_id": "C1",
+        "region": "SG",
+        "status": "Completed",
+        "payment_method": "Card",
+    }
+
+
+def seedMockSkus():
+    storage.save_records(
+        [
+            make_record("SKU-A", "Widget A", quantity=10, total_amount=100.0),
+            make_record("SKU-B", "Widget B", quantity=5, total_amount=500.0),
+        ],
+        source_filename="mock.xlsx",
+    )
+
+def testRanksByValueDescendingByDefault():
+    storage.save_records(
+        [
+            make_record("SKU-A", "Widget A", quantity=10, total_amount=100.0),
+            make_record("SKU-B", "Widget B", quantity=5, total_amount=500.0),
+        ],
+        source_filename="mock.xlsx",
+    )
+
+    result = storage.get_sku_ranking()
+
+    assert result["sku"].tolist() == ["SKU-B", "SKU-A"]
+    assert result["rank"].tolist() == [1, 2]
+
+
+def testRanksByVolumeAscending():
+    storage.save_records(
+        [
+            make_record("SKU-A", "Widget A", quantity=10, total_amount=100.0),
+            make_record("SKU-B", "Widget B", quantity=5, total_amount=500.0),
+        ],
+        source_filename="mock.xlsx",
+    )
+
+    result = storage.get_sku_ranking(metric="volume", order="asc")
+
+    assert result["sku"].tolist() == ["SKU-B", "SKU-A"]
+
+
+def testAggregatesMultipleOrdersForTheSameSku():
+    storage.save_records(
+        [
+            make_record("SKU-A", "Widget A", quantity=10, total_amount=100.0, order_id="O1"),
+            make_record("SKU-A", "Widget A", quantity=3, total_amount=30.0, order_id="O2"),
+        ],
+        source_filename="mock.xlsx",
+    )
+
+    result = storage.get_sku_ranking(metric="volume")
+
+    row = result.iloc[0]
+    assert row["sku"] == "SKU-A"
+    assert row["volume"] == 13
+    assert row["value"] == 130.0
+
+
+def testExcludesRecordsWithoutSku():
+    storage.save_records(
+        [
+            make_record(None, "No SKU Item", quantity=1, total_amount=10.0),
+            make_record("SKU-A", "Widget A", quantity=10, total_amount=100.0),
+        ],
+        source_filename="mock.xlsx",
+    )
+
+    result = storage.get_sku_ranking()
+
+    assert result["sku"].tolist() == ["SKU-A"]
+
+
+def testReturnsEmptyDataframeWhenNoRecordsIngested():
+    result = storage.get_sku_ranking()
+
+    assert result.empty
+    assert list(result.columns) == ["sku", "product_name", "volume", "value", "rank"]
+
+
+def testInvalidMetricRaisesValueError():
+    with pytest.raises(ValueError):
+        storage.get_sku_ranking(metric="invalid")
+
+
+def testInvalidOrderRaisesValueError():
+    with pytest.raises(ValueError):
+        storage.get_sku_ranking(order="invalid")
+
+def testDefaultsToRankingByValueDescending():
+    seed_mock_skus()
+
+    res = client.get("/api/sales/skus")
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["metric"] == "value"
+    assert body["order"] == "desc"
+    assert [row["sku"] for row in body["skus"]] == ["SKU-B", "SKU-A"]
+    assert body["skus"][0]["rank"] == 1
+
+def testRanksByVolumeWhenRequested():
+    seed_mock_skus()
+
+    res = client.get("/api/sales/skus", params={"metric": "volume", "order": "asc"})
+
+    assert res.status_code == 200
+    body = res.json()
+    assert [row["sku"] for row in body["skus"]] == ["SKU-B", "SKU-A"]
+
+
+def testRejectsInvalidMetric():
+    res = client.get("/api/sales/skus", params={"metric": "bogus"})
+
+    assert res.status_code == 400
+
+
+def testRejectsInvalidOrder():
+    res = client.get("/api/sales/skus", params={"order": "sideways"})
+
+    assert res.status_code == 400
+
+
+def testReturnsEmptyListWhenNoDataIngested():
+    res = client.get("/api/sales/skus")
+
+    assert res.status_code == 200
+    assert res.json()["skus"] == []

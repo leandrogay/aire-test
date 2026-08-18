@@ -7,7 +7,6 @@ DB_PATH = Path(__file__).resolve().parent.parent / "data" / "sales.db"
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 TABLE_NAME = "sales_records"
 
-
 def get_connection():
     return sqlite3.connect(DB_PATH)
 
@@ -64,3 +63,38 @@ def get_summary_stats():
         "total_revenue": float(round(df["total_amount"].sum(), 2)),
         "by_platform": by_platform,
     }
+
+def getSkuRanking(metric: str = "value", order: str = "desc") -> pd.DataFrame:
+    SKU_RANKING_METRICS = ("volume", "value")
+    SKU_RANKING_COLUMNS = ["sku", "product_name", "volume", "value", "rank"]
+    #Aggregate ingested sales records by SKU, ranked by total units sold (volume) or total revenue (value).
+    if metric not in SKU_RANKING_METRICS:
+        raise ValueError(f"metric must be one of {SKU_RANKING_METRICS}")
+    if order not in ("asc", "desc"):
+        raise ValueError("order must be 'asc' or 'desc'")
+
+    conn = get_connection()
+    try:
+        df = pd.read_sql(f"SELECT * FROM {TABLE_NAME}", conn)
+    except pd.errors.DatabaseError:
+        df = pd.DataFrame()
+    conn.close()
+
+    df = df[df["sku"].notna()] if not df.empty else df
+    if df.empty:
+        return pd.DataFrame(columns=SKU_RANKING_COLUMNS)
+
+    ranked = (
+        df.groupby("sku")
+        .agg(
+            product_name=("product_name", "first"),
+            volume=("quantity", "sum"),
+            value=("total_amount", "sum"),
+        )
+        .reset_index()
+    )
+    ranked["value"] = ranked["value"].round(2)
+    ranked = ranked.sort_values(metric, ascending=(order == "asc")).reset_index(drop=True)
+    ranked["rank"] = ranked.index + 1
+
+    return ranked[SKU_RANKING_COLUMNS]
