@@ -1,26 +1,25 @@
 'use client';
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 
 export default function IngestPage() {
   const [dragActive, setDragActive] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
+  const [duplicate, setDuplicate] = useState(null);
+  const [pendingFile, setPendingFile] = useState(null);
+  const dragDepth = useRef(0);
 
-  const handleFile = useCallback(async (file) => {
-    if (!file) return;
-    if (!file.name.endsWith('.xlsx') && !file.name.endsWith('.xls')) {
-      setError('Please upload an Excel file (.xlsx or .xls)');
-      return;
-    }
-
+  const uploadFile = useCallback(async (file, { overwrite = false } = {}) => {
     setUploading(true);
     setError(null);
     setResult(null);
+    setDuplicate(null);
 
     const formData = new FormData();
     formData.append('file', file);
+    formData.append('overwrite', overwrite);
 
     try {
       const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/ingest`, {
@@ -28,12 +27,20 @@ export default function IngestPage() {
         body: formData,
       });
 
-      if (!res.ok) {
-        const errData = await res.json();
-        throw new Error(errData.detail || 'Upload failed');
+      const data = await res.json();
+
+      if (res.status === 409) {
+        setPendingFile(file);
+        setDuplicate(data);
+        return;
       }
 
-      setResult(await res.json());
+      if (!res.ok) {
+        throw new Error(data.detail || 'Upload failed');
+      }
+
+      setPendingFile(null);
+      setResult(data);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -41,16 +48,45 @@ export default function IngestPage() {
     }
   }, []);
 
+  const handleFile = useCallback((file) => {
+    if (!file) return;
+    if (!file.name.endsWith('.xlsx') && !file.name.endsWith('.xls')) {
+      setError('Please upload an Excel file (.xlsx or .xls)');
+      return;
+    }
+    uploadFile(file);
+  }, [uploadFile]);
+
+  const handleConfirmOverwrite = () => {
+    if (pendingFile) uploadFile(pendingFile, { overwrite: true });
+  };
+
+  const handleCancelOverwrite = () => {
+    setDuplicate(null);
+    setPendingFile(null);
+  };
+
   const handleDrop = (e) => {
     e.preventDefault();
+    dragDepth.current = 0;
     setDragActive(false);
     handleFile(e.dataTransfer.files?.[0]);
   };
 
-  const handleDrag = (e) => {
+  const handleDragEnter = (e) => {
     e.preventDefault();
-    if (e.type === 'dragenter' || e.type === 'dragover') setDragActive(true);
-    else if (e.type === 'dragleave') setDragActive(false);
+    dragDepth.current += 1;
+    setDragActive(true);
+  };
+
+  const handleDragLeave = (e) => {
+    e.preventDefault();
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDragActive(false);
+  };
+
+  const handleDragOver = (e) => {
+    e.preventDefault();
   };
 
   return (
@@ -62,9 +98,10 @@ export default function IngestPage() {
         </p>
 
         <div
-          onDragEnter={handleDrag}
-          onDragOver={handleDrag}
-          onDragLeave={handleDrag}
+          data-testid="drop-zone"
+          onDragEnter={handleDragEnter}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
           onDrop={handleDrop}
           className={`border-2 border-dashed rounded-xl p-12 text-center transition-colors ${
             dragActive ? 'border-blue-500 bg-blue-50' : 'border-gray-300 bg-white'
@@ -93,9 +130,34 @@ export default function IngestPage() {
           </div>
         )}
 
+        {duplicate && (
+          <div className="mt-4 p-4 bg-amber-50 border border-amber-200 rounded-lg text-amber-800 text-sm">
+            <p>{duplicate.message}</p>
+            <div className="mt-3 flex gap-2">
+              <button
+                type="button"
+                onClick={handleConfirmOverwrite}
+                className="px-3 py-1.5 text-xs font-medium rounded bg-amber-600 text-white"
+              >
+                Overwrite existing data
+              </button>
+              <button
+                type="button"
+                onClick={handleCancelOverwrite}
+                className="px-3 py-1.5 text-xs font-medium rounded border border-amber-300 text-amber-700"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+
         {result && (
           <div className="mt-6 p-5 bg-white border border-gray-200 rounded-lg">
             <h2 className="font-medium text-gray-900 mb-3">Ingestion Summary</h2>
+            {result.overwritten && (
+              <p className="text-xs text-gray-400 mb-2">Existing data for this file was replaced.</p>
+            )}
             <ul className="text-sm text-gray-600 space-y-1">
               <li>File: {result.filename}</li>
               <li>Total rows: {result.rows_total}</li>

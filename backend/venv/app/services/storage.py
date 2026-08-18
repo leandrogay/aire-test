@@ -1,3 +1,4 @@
+import os
 import sqlite3
 from pathlib import Path
 from datetime import datetime
@@ -6,7 +7,6 @@ import pandas as pd
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "sales.db"
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 TABLE_NAME = "sales_records"
-
 
 def get_connection():
     return sqlite3.connect(DB_PATH)
@@ -17,7 +17,9 @@ def _sanitize(df: pd.DataFrame) -> pd.DataFrame:
     return df.astype(object).where(pd.notnull(df), None)
 
 
-def save_records(records: list[dict], source_filename: str):
+def save_records(records: list[dict], source_filename: str, replace: bool = False):
+    if replace:
+        delete_records_by_filename(source_filename)
     if not records:
         return
     df = pd.DataFrame(records)
@@ -25,6 +27,28 @@ def save_records(records: list[dict], source_filename: str):
     df["source_filename"] = source_filename
     conn = get_connection()
     df.to_sql(TABLE_NAME, conn, if_exists="append", index=False)
+    conn.close()
+
+
+def filename_already_ingested(filename: str) -> bool:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            f"SELECT 1 FROM {TABLE_NAME} WHERE source_filename = ? LIMIT 1", (filename,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    conn.close()
+    return row is not None
+
+
+def delete_records_by_filename(filename: str):
+    conn = get_connection()
+    try:
+        conn.execute(f"DELETE FROM {TABLE_NAME} WHERE source_filename = ?", (filename,))
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
     conn.close()
 
 
