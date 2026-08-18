@@ -7,7 +7,14 @@ from app.services.mapper import map_columns, clean_price, clean_quantity, clean_
 from app.services import storage
 
 
-def process_excel_file(file_obj: io.BytesIO, filename: str) -> dict:
+def process_excel_file(file_obj: io.BytesIO, filename: str, overwrite: bool = False) -> dict:
+    if not overwrite and storage.filename_already_ingested(filename):
+        return {
+            "filename": filename,
+            "duplicate": True,
+            "message": f"'{filename}' has already been ingested. Confirm to overwrite the existing data.",
+        }
+
     df = pd.read_excel(file_obj, engine="openpyxl")
     df, unmapped_fields = map_columns(df)
 
@@ -40,10 +47,12 @@ def process_excel_file(file_obj: io.BytesIO, filename: str) -> dict:
         except Exception as e:
             errors.append({"row": int(idx) + 2, "reason": str(e)})
 
-    storage.save_records(valid_records, source_filename=filename)
+    storage.save_records(valid_records, source_filename=filename, replace=overwrite)
 
     return {
         "filename": filename,
+        "duplicate": False,
+        "overwritten": overwrite,
         "rows_total": len(df),
         "rows_ingested": len(valid_records),
         "rows_skipped": len(errors),
