@@ -20,25 +20,97 @@ function toggleButtonClass(isActive) {
   }`;
 }
 
-export default function skuRanking() {
+export default function SkuRanking() {
   const [metric, setMetric] = useState('value');
   const [order, setOrder] = useState('desc');
+  const [months, setMonths] = useState([]);
+  const [selectedMonth, setSelectedMonth] = useState(null);
+  const [weeks, setWeeks] = useState([]);
+  const [selectedWeek, setSelectedWeek] = useState('');
+  const [weeksLoadedForMonth, setWeeksLoadedForMonth] = useState(null);
   const [skus, setSkus] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
+  // A previously picked week may not exist in a newly selected month, so
+  // reset back to "all weeks" whenever the month changes. Adjusting state
+  // during render (rather than in an effect) avoids an extra cascading
+  // render, per React's guidance on resetting state when a value changes.
+  if (selectedMonth !== weeksLoadedForMonth) {
+    setWeeksLoadedForMonth(selectedMonth);
+    setSelectedWeek('');
+  }
+
+  // Load the months that actually have data, then default to the most recent one
   useEffect(() => {
+    let cancelled = false;
+
+    async function fetchMonths() {
+      try {
+        const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/sales/months`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'Failed to load available months');
+        if (cancelled) return;
+        setMonths(data.months);
+        if (data.months.length > 0) {
+          setSelectedMonth(data.months[0].value);
+        } else {
+          setLoading(false);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError(err.message);
+          setLoading(false);
+        }
+      }
+    }
+
+    fetchMonths();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Load the weeks within the selected month, and reset back to "all weeks" whenever the month changes (a previously picked week may not exist in the new month).
+  useEffect(() => {
+    if (!selectedMonth) return undefined;
+
+    let cancelled = false;
+
+    async function fetchWeeks() {
+      try {
+        const res = await fetch(
+          `${process.env.NEXT_PUBLIC_API_URL}/api/sales/weeks?month=${selectedMonth}`
+        );
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'Failed to load available weeks');
+        if (!cancelled) setWeeks(data.weeks);
+      } catch (err) {
+        if (!cancelled) setError(err.message);
+      }
+    }
+
+    fetchWeeks();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedMonth]);
+
+  useEffect(() => {
+    if (!selectedMonth) return undefined;
+
     let cancelled = false;
 
     async function fetchRanking() {
       setLoading(true);
       setError(null);
       try {
+        const weekParam = selectedWeek ? `&week=${selectedWeek}` : '';
         const res = await fetch(
-          `${process.env.NEXT_PUBLIC_API_URL}/api/sales/skus?metric=${metric}&order=${order}`
+          `${process.env.NEXT_PUBLIC_API_URL}/api/sales/skus?metric=${metric}&order=${order}&month=${selectedMonth}${weekParam}`
         );
-        if (!res.ok) throw new Error('Failed to load SKU ranking');
         const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'Failed to load SKU ranking');
         if (!cancelled) setSkus(data.skus);
       } catch (err) {
         if (!cancelled) setError(err.message);
@@ -51,7 +123,7 @@ export default function skuRanking() {
     return () => {
       cancelled = true;
     };
-  }, [metric, order]);
+  }, [metric, order, selectedMonth, selectedWeek]);
 
   return (
     <div className="bg-white rounded-lg border border-gray-200 p-5 mb-8">
@@ -80,6 +152,36 @@ export default function skuRanking() {
               {o.label}
             </button>
           ))}
+
+          <select
+            aria-label="Month"
+            value={selectedMonth ?? ''}
+            onChange={(e) => setSelectedMonth(e.target.value)}
+            disabled={months.length === 0}
+            className="px-3 py-1 text-xs rounded-full border bg-white text-gray-600 border-gray-300 disabled:opacity-50"
+          >
+            {months.length === 0 && <option value="">No data available</option>}
+            {months.map((m) => (
+              <option key={m.value} value={m.value}>
+                {m.label}
+              </option>
+            ))}
+          </select>
+
+          <select
+            aria-label="Week"
+            value={selectedWeek}
+            onChange={(e) => setSelectedWeek(e.target.value)}
+            disabled={weeks.length === 0}
+            className="px-3 py-1 text-xs rounded-full border bg-white text-gray-600 border-gray-300 disabled:opacity-50"
+          >
+            <option value="">All weeks</option>
+            {weeks.map((w) => (
+              <option key={w.value} value={w.value}>
+                {w.label}
+              </option>
+            ))}
+          </select>
         </div>
       </div>
 

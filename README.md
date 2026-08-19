@@ -50,7 +50,7 @@ source venv/bin/activate
 Install dependencies:
 
 ```bash
-pip install fastapi uvicorn pandas openpyxl python-multipart
+pip install fastapi uvicorn pandas openpyxl python-multipart python-dotenv google-cloud-bigquery db-dtypes
 ```
 
 ### 2. Frontend setup
