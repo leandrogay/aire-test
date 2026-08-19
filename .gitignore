@@ -2,6 +2,7 @@
 backend/venv/scripts
 backend/venv/Lib
 backend/venv/app/data
+backend/venv/credentials
 backend/__pycache__/
 backend/**/__pycache__/
 backend/*.pyc

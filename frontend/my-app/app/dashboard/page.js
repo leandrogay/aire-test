@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import SkuRanking from '../../components/SkuRanking';
 
 export default function DashboardPage() {
   const [data, setData] = useState(null);
@@ -65,6 +66,8 @@ export default function DashboardPage() {
             </div>
           </div>
         )}
+
+        <SkuRanking />
 
         <div className="bg-white rounded-lg border border-gray-200 overflow-x-auto">
           <p className="text-sm font-medium text-gray-700 p-5 pb-0">Recently Ingested Records</p>

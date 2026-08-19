@@ -1,0 +1,540 @@
+import pandas as pd
+import pytest
+from fastapi.testclient import TestClient
+from google.api_core.exceptions import Forbidden
+from google.auth.exceptions import DefaultCredentialsError
+
+from app.main import app
+from app.services import storage
+
+client = TestClient(app)
+
+
+class FakeQueryJob:
+    def __init__(self, df):
+        self._df = df
+
+    def result(self):
+        return self
+
+    def to_dataframe(self):
+        return self._df
+
+
+class FakeBigQueryClient:
+    """Stands in for google.cloud.bigquery.Client so tests never hit real BigQuery."""
+
+    def __init__(self, df):
+        self._df = df
+        self.queries = []
+        self.job_configs = []
+
+    def query(self, sql, job_config=None):
+        self.queries.append(sql)
+        self.job_configs.append(job_config)
+        return FakeQueryJob(self._df)
+
+
+def bq_rows(rows):
+    """rows pre-ordered the way BigQuery's ORDER BY would already return them."""
+    return pd.DataFrame(rows, columns=["sku", "product_name", "volume", "value"])
+
+
+def bq_months(months):
+    return pd.DataFrame({"month": months})
+
+
+def bq_weeks(period_starts):
+    return pd.DataFrame({"period_start": period_starts})
+
+
+def patch_bigquery(monkeypatch, df):
+    fake_client = FakeBigQueryClient(df)
+    monkeypatch.setattr(storage, "get_bigquery_client", lambda: fake_client)
+    return fake_client
+
+
+def param_value(job_config, name):
+    return next(p.value for p in job_config.query_parameters if p.name == name)
+
+
+# --- storage.get_available_ranking_months ---
+
+
+def test_get_available_ranking_months_returns_the_queried_months(monkeypatch):
+    patch_bigquery(monkeypatch, bq_months(["2026-02", "2026-01"]))
+
+    months = storage.get_available_ranking_months()
+
+    assert months == ["2026-02", "2026-01"]
+
+
+def test_get_available_ranking_months_queries_the_configured_table(monkeypatch):
+    fake_client = patch_bigquery(monkeypatch, bq_months([]))
+
+    storage.get_available_ranking_months()
+
+    assert storage.BQ_TABLE in fake_client.queries[0]
+
+
+def test_get_available_ranking_months_returns_empty_list_when_no_data(monkeypatch):
+    patch_bigquery(monkeypatch, bq_months([]))
+
+    assert storage.get_available_ranking_months() == []
+
+
+# --- storage.get_available_ranking_weeks ---
+
+
+def test_get_available_ranking_weeks_numbers_weeks_relative_to_the_month_not_the_year(monkeypatch):
+    # BigQuery's own period_label numbers weeks continuously across the
+    # whole year (e.g. "Week 32" for early August), not restarting at 1
+    # each month. The dropdown must always start at "Week 1" for whichever
+    # month is selected, regardless of that week's position in the year -
+    # these August dates prove it's not coincidentally correct only for
+    # January.
+    patch_bigquery(monkeypatch, bq_weeks(["2026-08-06", "2026-08-13"]))
+
+    weeks = storage.get_available_ranking_weeks(month="2026-08")
+
+    assert weeks == [
+        {"value": "2026-08-06", "label": "Week 1 (06-08-2026)"},
+        {"value": "2026-08-13", "label": "Week 2 (13-08-2026)"},
+    ]
+
+
+def test_get_available_ranking_weeks_numbers_a_five_week_month_up_to_five(monkeypatch):
+    patch_bigquery(monkeypatch, bq_weeks([
+        "2026-01-01", "2026-01-08", "2026-01-15", "2026-01-22", "2026-01-29",
+    ]))
+
+    weeks = storage.get_available_ranking_weeks(month="2026-01")
+
+    assert [w["label"] for w in weeks] == [
+        "Week 1 (01-01-2026)",
+        "Week 2 (08-01-2026)",
+        "Week 3 (15-01-2026)",
+        "Week 4 (22-01-2026)",
+        "Week 5 (29-01-2026)",
+    ]
+
+
+def test_get_available_ranking_weeks_filters_to_the_requested_month(monkeypatch):
+    fake_client = patch_bigquery(monkeypatch, bq_weeks([]))
+
+    storage.get_available_ranking_weeks(month="2026-03")
+
+    assert param_value(fake_client.job_configs[0], "month") == "2026-03"
+    assert storage.BQ_TABLE in fake_client.queries[0]
+
+
+def test_get_available_ranking_weeks_returns_empty_list_when_no_data(monkeypatch):
+    patch_bigquery(monkeypatch, bq_weeks([]))
+
+    assert storage.get_available_ranking_weeks(month="2026-01") == []
+
+
+def test_get_available_ranking_weeks_rejects_invalid_month_without_querying(monkeypatch):
+    fake_client = patch_bigquery(monkeypatch, bq_weeks([]))
+
+    with pytest.raises(ValueError):
+        storage.get_available_ranking_weeks(month="not-a-month")
+
+    assert fake_client.queries == []
+
+
+# --- storage.get_sku_ranking (queries the client's BigQuery sellout table) ---
+
+
+def test_queries_the_configured_sellout_table(monkeypatch):
+    fake_client = patch_bigquery(monkeypatch, bq_rows([]))
+
+    storage.get_sku_ranking(month="2026-01")
+
+    assert storage.BQ_TABLE in fake_client.queries[0]
+
+
+def test_ranks_by_value_descending_by_default(monkeypatch):
+    fake_client = patch_bigquery(monkeypatch, bq_rows([
+        ("SKU-B", "Widget B", 5, 500.0),
+        ("SKU-A", "Widget A", 10, 100.0),
+    ]))
+
+    result = storage.get_sku_ranking(month="2026-01")
+
+    assert "ORDER BY value DESC" in fake_client.queries[0]
+    assert result["sku"].tolist() == ["SKU-B", "SKU-A"]
+    assert result["rank"].tolist() == [1, 2]
+
+
+def test_ranks_by_volume_ascending_when_requested(monkeypatch):
+    fake_client = patch_bigquery(monkeypatch, bq_rows([
+        ("SKU-B", "Widget B", 5, 500.0),
+        ("SKU-A", "Widget A", 10, 100.0),
+    ]))
+
+    result = storage.get_sku_ranking(metric="volume", order="asc", month="2026-01")
+
+    assert "ORDER BY volume ASC" in fake_client.queries[0]
+    assert result["sku"].tolist() == ["SKU-B", "SKU-A"]
+
+
+def test_filters_to_the_requested_month(monkeypatch):
+    fake_client = patch_bigquery(monkeypatch, bq_rows([]))
+
+    storage.get_sku_ranking(month="2026-03")
+
+    assert param_value(fake_client.job_configs[0], "month") == "2026-03"
+    assert "period_type = 'week'" in fake_client.queries[0]
+
+
+def test_filters_to_a_specific_week_when_requested(monkeypatch):
+    fake_client = patch_bigquery(monkeypatch, bq_rows([]))
+
+    storage.get_sku_ranking(month="2026-01", week="2026-01-08")
+
+    assert str(param_value(fake_client.job_configs[0], "week")) == "2026-01-08"
+    assert "period_start = @week" in fake_client.queries[0]
+
+
+def test_omitting_week_does_not_add_a_week_filter(monkeypatch):
+    fake_client = patch_bigquery(monkeypatch, bq_rows([]))
+
+    storage.get_sku_ranking(month="2026-01")
+
+    assert "period_start = @week" not in fake_client.queries[0]
+    with pytest.raises(StopIteration):
+        param_value(fake_client.job_configs[0], "week")
+
+
+def test_malformed_week_raises_value_error_without_querying(monkeypatch):
+    fake_client = patch_bigquery(monkeypatch, bq_rows([]))
+
+    with pytest.raises(ValueError):
+        storage.get_sku_ranking(month="2026-01", week="Jan 8")
+
+    assert fake_client.queries == []
+
+
+def test_missing_month_raises_value_error_without_querying(monkeypatch):
+    fake_client = patch_bigquery(monkeypatch, bq_rows([]))
+
+    with pytest.raises(ValueError):
+        storage.get_sku_ranking(month=None)
+
+    assert fake_client.queries == []
+
+
+def test_malformed_month_raises_value_error_without_querying(monkeypatch):
+    fake_client = patch_bigquery(monkeypatch, bq_rows([]))
+
+    with pytest.raises(ValueError):
+        storage.get_sku_ranking(month="March 2026")
+
+    assert fake_client.queries == []
+
+
+def test_treats_missing_revenue_as_zero_for_non_fairprice_retailers(monkeypatch):
+    # revenue is only populated for FairPrice per the schema; a SKU sold
+    # only through other retailers should still appear, ranked at 0 value
+    # rather than being dropped or blowing up on a null.
+    patch_bigquery(monkeypatch, bq_rows([
+        ("SKU-A", "Widget A", 10, 0.0),
+    ]))
+
+    result = storage.get_sku_ranking(metric="value", month="2026-01")
+
+    assert result.iloc[0]["value"] == 0.0
+
+
+def test_shapes_a_realistic_multi_sku_result_correctly(monkeypatch):
+    # Values below are the real GROUP BY sku output (SUM(quantity_units),
+    # SUM(revenue), ORDER BY value DESC) from an actual export of the
+    # client's aire-data.Aire_Data.sellout table (9 real SKUs, ~5800 weekly
+    # rows across fairprice_online/fairprice_offline). Hardcoded here rather
+    # than committing the raw export, since that's real client sales data.
+    # This exercises rounding/rank-assignment against realistic magnitudes
+    # and decimals, not just the small synthetic fixtures used elsewhere.
+    fake_client = patch_bigquery(monkeypatch, bq_rows([
+        ("13255044", "Aire Adult Pants S/M", 17133.0, 131165.78),
+        ("13255045", "Aire Adult Pants L", 14009.0, 122949.00),
+        ("13255043", "Aire Adult Pants XL", 10140.0, 102543.39),
+        ("13271340", "Aire Ultra Pants L", 2967.0, 40366.75),
+        ("13271337", "Aire Ultra Pants XL", 1777.0, 28997.46),
+        ("13271339", "Aire Ultra Pants S/M", 2149.0, 25566.52),
+        ("13271338", "Aire Ultra Tape L", 543.0, 4180.72),
+        ("13271342", "Aire Ultra Tape XL", 258.0, 2748.46),
+        ("13271341", "Aire Ultra Tape S/M", 206.0, 1591.39),
+    ]))
+
+    result = storage.get_sku_ranking(metric="value", month="2026-01")
+
+    assert "ORDER BY value DESC" in fake_client.queries[0]
+    assert len(result) == 9
+    assert result.iloc[0]["sku"] == "13255044"
+    assert result.iloc[0]["value"] == 131165.78
+    assert result.iloc[0]["rank"] == 1
+    assert result.iloc[-1]["sku"] == "13271341"
+    assert result.iloc[-1]["rank"] == 9
+    assert result["rank"].tolist() == list(range(1, 10))
+
+
+def test_returns_empty_dataframe_when_the_table_has_no_matching_rows(monkeypatch):
+    patch_bigquery(monkeypatch, bq_rows([]))
+
+    result = storage.get_sku_ranking(month="2026-01")
+
+    assert result.empty
+    assert list(result.columns) == storage.SKU_RANKING_COLUMNS
+
+
+def test_invalid_metric_raises_value_error_without_querying(monkeypatch):
+    fake_client = patch_bigquery(monkeypatch, bq_rows([]))
+
+    with pytest.raises(ValueError):
+        storage.get_sku_ranking(metric="invalid", month="2026-01")
+
+    assert fake_client.queries == []
+
+
+def test_invalid_order_raises_value_error_without_querying(monkeypatch):
+    fake_client = patch_bigquery(monkeypatch, bq_rows([]))
+
+    with pytest.raises(ValueError):
+        storage.get_sku_ranking(order="invalid", month="2026-01")
+
+    assert fake_client.queries == []
+
+
+# --- GET /api/sales/months ---
+
+
+def test_lists_available_months(monkeypatch):
+    monkeypatch.setattr(storage, "get_available_ranking_months", lambda: ["2026-02", "2026-01"])
+
+    res = client.get("/api/sales/months")
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["months"] == [
+        {"value": "2026-02", "label": "February 2026"},
+        {"value": "2026-01", "label": "January 2026"},
+    ]
+
+
+def test_lists_no_months_when_none_available(monkeypatch):
+    monkeypatch.setattr(storage, "get_available_ranking_months", lambda: [])
+
+    res = client.get("/api/sales/months")
+
+    assert res.status_code == 200
+    assert res.json()["months"] == []
+
+
+def test_months_returns_503_when_credentials_are_missing(monkeypatch):
+    def fake_get_available_ranking_months():
+        raise DefaultCredentialsError("Your default credentials were not found.")
+
+    monkeypatch.setattr(storage, "get_available_ranking_months", fake_get_available_ranking_months)
+
+    res = client.get("/api/sales/months")
+
+    assert res.status_code == 503
+
+
+def test_months_returns_503_when_bigquery_rejects_the_request(monkeypatch):
+    def fake_get_available_ranking_months():
+        raise Forbidden("Access Denied")
+
+    monkeypatch.setattr(storage, "get_available_ranking_months", fake_get_available_ranking_months)
+
+    res = client.get("/api/sales/months")
+
+    assert res.status_code == 503
+
+
+# --- GET /api/sales/weeks ---
+
+
+def test_lists_available_weeks_for_the_requested_month(monkeypatch):
+    monkeypatch.setattr(
+        storage,
+        "get_available_ranking_weeks",
+        lambda month: [
+            {"value": "2026-01-01", "label": "Week 1 (01-01-2026)"},
+            {"value": "2026-01-08", "label": "Week 2 (08-01-2026)"},
+        ],
+    )
+
+    res = client.get("/api/sales/weeks", params={"month": "2026-01"})
+
+    assert res.status_code == 200
+    assert res.json()["weeks"] == [
+        {"value": "2026-01-01", "label": "Week 1 (01-01-2026)"},
+        {"value": "2026-01-08", "label": "Week 2 (08-01-2026)"},
+    ]
+
+
+def test_weeks_rejects_missing_or_invalid_month(monkeypatch):
+    def fake_get_available_ranking_weeks(month):
+        raise ValueError("month must be in YYYY-MM format")
+
+    monkeypatch.setattr(storage, "get_available_ranking_weeks", fake_get_available_ranking_weeks)
+
+    res = client.get("/api/sales/weeks")
+
+    assert res.status_code == 400
+
+
+def test_weeks_returns_503_when_credentials_are_missing(monkeypatch):
+    def fake_get_available_ranking_weeks(month):
+        raise DefaultCredentialsError("Your default credentials were not found.")
+
+    monkeypatch.setattr(storage, "get_available_ranking_weeks", fake_get_available_ranking_weeks)
+
+    res = client.get("/api/sales/weeks", params={"month": "2026-01"})
+
+    assert res.status_code == 503
+
+
+def test_weeks_returns_503_when_bigquery_rejects_the_request(monkeypatch):
+    def fake_get_available_ranking_weeks(month):
+        raise Forbidden("Access Denied")
+
+    monkeypatch.setattr(storage, "get_available_ranking_weeks", fake_get_available_ranking_weeks)
+
+    res = client.get("/api/sales/weeks", params={"month": "2026-01"})
+
+    assert res.status_code == 503
+
+
+# --- GET /api/sales/skus ---
+
+
+def fake_ranking_result(rows):
+    df = pd.DataFrame(rows, columns=storage.SKU_RANKING_COLUMNS)
+    return df
+
+
+def test_defaults_to_ranking_by_value_descending(monkeypatch):
+    monkeypatch.setattr(
+        storage,
+        "get_sku_ranking",
+        lambda metric="value", order="desc", month=None, week=None: fake_ranking_result([
+            ("SKU-B", "Widget B", 5, 500.0, 1),
+            ("SKU-A", "Widget A", 10, 100.0, 2),
+        ]),
+    )
+
+    res = client.get("/api/sales/skus", params={"month": "2026-01"})
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["metric"] == "value"
+    assert body["order"] == "desc"
+    assert body["month"] == "2026-01"
+    assert [row["sku"] for row in body["skus"]] == ["SKU-B", "SKU-A"]
+    assert body["skus"][0]["rank"] == 1
+
+
+def test_forwards_metric_order_month_and_week_query_params(monkeypatch):
+    captured = {}
+
+    def fake_get_sku_ranking(metric="value", order="desc", month=None, week=None):
+        captured["metric"] = metric
+        captured["order"] = order
+        captured["month"] = month
+        captured["week"] = week
+        return fake_ranking_result([])
+
+    monkeypatch.setattr(storage, "get_sku_ranking", fake_get_sku_ranking)
+
+    res = client.get(
+        "/api/sales/skus",
+        params={"metric": "volume", "order": "asc", "month": "2026-03", "week": "2026-03-08"},
+    )
+
+    assert captured == {"metric": "volume", "order": "asc", "month": "2026-03", "week": "2026-03-08"}
+    assert res.json()["week"] == "2026-03-08"
+
+
+def test_omitting_week_still_works_and_reports_week_as_null(monkeypatch):
+    monkeypatch.setattr(
+        storage,
+        "get_sku_ranking",
+        lambda metric="value", order="desc", month=None, week=None: fake_ranking_result([]),
+    )
+
+    res = client.get("/api/sales/skus", params={"month": "2026-01"})
+
+    assert res.status_code == 200
+    assert res.json()["week"] is None
+
+
+def test_rejects_invalid_metric(monkeypatch):
+    def fake_get_sku_ranking(metric="value", order="desc", month=None, week=None):
+        raise ValueError("metric must be one of ('volume', 'value')")
+
+    monkeypatch.setattr(storage, "get_sku_ranking", fake_get_sku_ranking)
+
+    res = client.get("/api/sales/skus", params={"metric": "bogus", "month": "2026-01"})
+
+    assert res.status_code == 400
+
+
+def test_rejects_invalid_order(monkeypatch):
+    def fake_get_sku_ranking(metric="value", order="desc", month=None, week=None):
+        raise ValueError("order must be 'asc' or 'desc'")
+
+    monkeypatch.setattr(storage, "get_sku_ranking", fake_get_sku_ranking)
+
+    res = client.get("/api/sales/skus", params={"order": "sideways", "month": "2026-01"})
+
+    assert res.status_code == 400
+
+
+def test_rejects_missing_or_invalid_month(monkeypatch):
+    def fake_get_sku_ranking(metric="value", order="desc", month=None, week=None):
+        raise ValueError("month must be in YYYY-MM format")
+
+    monkeypatch.setattr(storage, "get_sku_ranking", fake_get_sku_ranking)
+
+    res = client.get("/api/sales/skus")
+
+    assert res.status_code == 400
+
+
+def test_returns_empty_list_when_no_rows(monkeypatch):
+    monkeypatch.setattr(
+        storage,
+        "get_sku_ranking",
+        lambda metric="value", order="desc", month=None, week=None: fake_ranking_result([]),
+    )
+
+    res = client.get("/api/sales/skus", params={"month": "2026-01"})
+
+    assert res.status_code == 200
+    assert res.json()["skus"] == []
+
+
+def test_returns_503_with_a_clear_message_when_credentials_are_missing(monkeypatch):
+    def fake_get_sku_ranking(metric="value", order="desc", month=None, week=None):
+        raise DefaultCredentialsError("Your default credentials were not found.")
+
+    monkeypatch.setattr(storage, "get_sku_ranking", fake_get_sku_ranking)
+
+    res = client.get("/api/sales/skus", params={"month": "2026-01"})
+
+    assert res.status_code == 503
+    assert "credentials" in res.json()["detail"].lower()
+
+
+def test_returns_503_when_bigquery_rejects_the_request(monkeypatch):
+    def fake_get_sku_ranking(metric="value", order="desc", month=None, week=None):
+        raise Forbidden("Access Denied")
+
+    monkeypatch.setattr(storage, "get_sku_ranking", fake_get_sku_ranking)
+
+    res = client.get("/api/sales/skus", params={"month": "2026-01"})
+
+    assert res.status_code == 503

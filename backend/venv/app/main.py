@@ -1,6 +1,11 @@
+from pathlib import Path
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
+
+load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
+
 from app.routers import ingest, dashboard
 
 app = FastAPI()
